@@ -92,34 +92,40 @@ static float stdDev = TDOA_ENGINE_MEASUREMENT_NOISE_STD;
 // The default receive time in the anchors for messages from other anchors is 0
 // and is overwritten with the actual receive time when a packet arrives.
 // That is, if no message was received the rx time will be 0.
+
+// По умолчанию, время получения пакета от анкера = 0
+// Актуальное значение перезаписывается
+// Если пакет не получен - время останется = 0
+
 static bool isValidTimeStamp(const int64_t anchorRxTime) {
-  return anchorRxTime != 0;
+  return anchorRxTime != 0;  // Проверка, что время не 0 (пакет от анкера получен)
 }
 
 static bool isConsecutiveIds(const uint8_t previousAnchor, const uint8_t currentAnchor) {
-  return (((previousAnchor + 1) & 0x07) == currentAnchor);
+  return (((previousAnchor + 1) & 0x07) == currentAnchor); // Проверка, что айди нового анкера ПОСЛЕДОВАТЕЛЬНО и не больше 7 (0x07 = 00000111)
 }
 
+// Обновляет данные для удалённых (remote) якорей в контексте системы измерения времени прибытия (TDoA) на основе полученного пакета данных. 
 static void updateRemoteData(tdoaAnchorContext_t* anchorCtx, const rangePacket2_t* packet) {
-  const uint8_t anchorId = tdoaStorageGetId(anchorCtx);
-  for (uint8_t i = 0; i < LOCODECK_NR_OF_TDOA2_ANCHORS; i++) {
-    if (anchorId != i) {
-      uint8_t remoteId = i;
-      int64_t remoteRxTime = packet->timestamps[i];
-      uint8_t remoteSeqNr = packet->sequenceNrs[i] & 0x7f;
+  const uint8_t anchorId = tdoaStorageGetId(anchorCtx);  // Получение текущего идентификатора якоря
+  for (uint8_t i = 0; i < LOCODECK_NR_OF_TDOA2_ANCHORS; i++) {  // Цикл по всем якорям
+    if (anchorId != i) {  // Для каждого якоря, кроме текущего (только удаленные)
+      uint8_t remoteId = i;  // Получаем айди
+      int64_t remoteRxTime = packet->timestamps[i];  // Получаем время получения сигнала для удаленного анкера
+      uint8_t remoteSeqNr = packet->sequenceNrs[i] & 0x7f;  // Получаем номер пакета с обнулением страшего бита ???
 
-      if (isValidTimeStamp(remoteRxTime)) {
-        tdoaStorageSetRemoteRxTime(anchorCtx, remoteId, remoteRxTime, remoteSeqNr);
+      if (isValidTimeStamp(remoteRxTime)) {  // Если время валидное
+        tdoaStorageSetRemoteRxTime(anchorCtx, remoteId, remoteRxTime, remoteSeqNr);  // Сохраняем временную метку удаленного анкера с инфой о пакете
       }
 
-      bool hasDistance = (packet->distances[i] != 0);
-      if (hasDistance) {
-        int64_t tof = packet->distances[i];
-        if (isValidTimeStamp(tof)) {
-          tdoaStorageSetRemoteTimeOfFlight(anchorCtx, remoteId, tof);
+      bool hasDistance = (packet->distances[i] != 0);  
+      if (hasDistance) {  // Если в пакете есть расстояния (tof)
+        int64_t tof = packet->distances[i];  // Получаем tof
+        if (isValidTimeStamp(tof)) {  // Если валидный tof
+          tdoaStorageSetRemoteTimeOfFlight(anchorCtx, remoteId, tof);  // Сохраняем tof для удаленного анкера
 
-          if (isConsecutiveIds(previousAnchor, anchorId)) {
-            logAnchorDistance[anchorId] = packet->distances[previousAnchor];
+          if (isConsecutiveIds(previousAnchor, anchorId)) {  // Если  текущий якорь и предыдщуий удаленный - последовательные 
+            logAnchorDistance[anchorId] = packet->distances[previousAnchor];  // Записываем расстояние до предыдущего удаленного в массив
           }
         }
       }
@@ -127,108 +133,137 @@ static void updateRemoteData(tdoaAnchorContext_t* anchorCtx, const rangePacket2_
   }
 }
 
+// Обрабатывает LPP (Loco Posisioning Protocol) пакеты,
+// полученные в контексте системы измерения времени прибытия (TDoA).
+// Она анализирует пакет данных, определяет, является ли он коротким LPP пакетом,
+// и затем выполняет соответствующую обработку для якоря.
+
+// dataLength: длина данных, полученных в пакете.
+// rxPacket: указатель на структуру packet_t, которая содержит информацию о принятом пакете,
+// включая полезную нагрузку и адрес источника.
+// anchorCtx: указатель на контекст якоря tdoaAnchorContext_t, 
+// который используется для дальнейшей обработки данных.
 static void handleLppPacket(const int dataLength, const packet_t* rxPacket, tdoaAnchorContext_t* anchorCtx) {
-  const int32_t payloadLength = dataLength - MAC802154_HEADER_LENGTH;
-  const int32_t startOfLppDataInPayload = LPS_TDOA2_LPP_HEADER;
-  const int32_t lppDataLength = payloadLength - startOfLppDataInPayload;
+  const int32_t payloadLength = dataLength - MAC802154_HEADER_LENGTH;  // Длина полезной нагрузки. Разница между всей длиной и длиной заголовка
+  const int32_t startOfLppDataInPayload = LPS_TDOA2_LPP_HEADER;  // Начало полезной нагрузки в пакете
+  const int32_t lppDataLength = payloadLength - startOfLppDataInPayload;  // Длина даты без заголовка LPP
 
-  if (lppDataLength > 0) {
-    const uint8_t lppPacketHeader = rxPacket->payload[LPS_TDOA2_LPP_HEADER];
-    if (lppPacketHeader == LPP_HEADER_SHORT_PACKET) {
-      int srcId = -1;
+  if (lppDataLength > 0) {  // Если есть LPP данные
+    const uint8_t lppPacketHeader = rxPacket->payload[LPS_TDOA2_LPP_HEADER];  // Извлекаем заголовок
+    if (lppPacketHeader == LPP_HEADER_SHORT_PACKET) {  // Если соответствует SHORT_PACKET
+      int srcId = -1;  // Init со значением 1
 
-      for (int i=0; i < LOCODECK_NR_OF_TDOA2_ANCHORS; i++) {
+      for (int i=0; i < LOCODECK_NR_OF_TDOA2_ANCHORS; i++) {  // Находим адрес.
         if (rxPacket->sourceAddress == options->anchorAddress[i]) {
-          srcId = i;
-          break;
+          srcId = i;  // Сравниваем адрес, указанный в пакете, со всеми известными нам адресами анкеров.
+          break;  // При совпадении - запоминаем
         }
       }
 
-      if (srcId >= 0) {
-        lpsHandleLppShortPacket(srcId, &rxPacket->payload[LPS_TDOA2_LPP_TYPE], anchorCtx);
+      if (srcId >= 0) {  // Если адрес был найден
+        lpsHandleLppShortPacket(srcId, &rxPacket->payload[LPS_TDOA2_LPP_TYPE], anchorCtx);  // Обрабатываем SHORT_PACKET
       }
     }
   }
 }
 
 // Send an LPP packet, the radio will automatically go back in RX mode
+// Отправить LPP пакет. UWB автоматически уйдет в RX mode.
+// dev: указатель на структуру dwDevice_t, представляющую устройство, 
+// через которое будет отправляться пакет.
+// packet: указатель на структуру lpsLppShortPacket_t, содержащую 
+// данные для отправки, включая полезную нагрузку и информацию 
+// о длине и адресе назначения.
 static void sendLppShort(dwDevice_t *dev, lpsLppShortPacket_t *packet)
 {
-  static packet_t txPacket;
-  dwIdle(dev);
+  static packet_t txPacket;  // создаем пакет
+  dwIdle(dev);  // uwb уходит в idle
 
-  MAC80215_PACKET_INIT(txPacket, MAC802154_TYPE_DATA);
+  MAC80215_PACKET_INIT(txPacket, MAC802154_TYPE_DATA);  // Инициализруем пакет макросом под нужный тип
 
-  txPacket.payload[LPS_TDOA2_TYPE_INDEX] = LPP_HEADER_SHORT_PACKET;
-  memcpy(&txPacket.payload[LPS_TDOA2_SEND_LPP_PAYLOAD_INDEX], packet->data, packet->length);
+  txPacket.payload[LPS_TDOA2_TYPE_INDEX] = LPP_HEADER_SHORT_PACKET;  // Заголовок указывает на тип SHORT_PACKET (0xF0)
+  memcpy(&txPacket.payload[LPS_TDOA2_SEND_LPP_PAYLOAD_INDEX], packet->data, packet->length);  // Содержимое пакета переносится в отправляемый паккет, начиная с нужного индекса
 
-  txPacket.pan = 0xbccf;
-  txPacket.sourceAddress = 0xbccf000000000000 | 0xff;
-  txPacket.destAddress = options->anchorAddress[packet->dest];
+  txPacket.pan = 0xbccf;  // Установка PAN
+  txPacket.sourceAddress = 0xbccf000000000000 | 0xff;  // Указывается адрес источника ???
+  txPacket.destAddress = options->anchorAddress[packet->dest];  // Адрес назначения (находим через айди анкера)
 
-  dwNewTransmit(dev);
-  dwSetDefaults(dev);
-  dwSetData(dev, (uint8_t*)&txPacket, MAC802154_HEADER_LENGTH+1+packet->length);
+  dwNewTransmit(dev);  // Перевод UWB в режим TX
+  dwSetDefaults(dev);  // Параметры по умолчанию для передачи
+  dwSetData(dev, (uint8_t*)&txPacket, MAC802154_HEADER_LENGTH+1+packet->length);  // Переносим пакет в буфер для отправки, +1 - заголовок LPP
 
-  dwWaitForResponse(dev, true);
-  dwStartTransmit(dev);
+  dwWaitForResponse(dev, true);  // Режим ожидания ответа после передачи
+  dwStartTransmit(dev);  // Начать передачу
 }
 
+// Обрабатывает приём данных с устройства dwDevice_t - UWB-радиомодуля. 
+// Функция выполняет несколько задач, связанных с обработкой пакетов TDoA2
+//  и взаимодействием с якорями в системе локализации.
+
+// dev: указатель на структуру 
+// dwDevice_t, представляющую радиоустройство, через которое получены данные.
+
+// bool: Функция возвращает true, если был отправлен короткий LPP пакет (lppSent = true), 
+// и false в противном случае.
 static bool rxcallback(dwDevice_t *dev) {
   tdoaStats_t* stats = &tdoaEngineState.stats;
-  STATS_CNT_RATE_EVENT(&stats->packetsReceived);
+  STATS_CNT_RATE_EVENT(&stats->packetsReceived);  // Обновляем счетчик полученных пакетов
 
-  int dataLength = dwGetDataLength(dev);
+  int dataLength = dwGetDataLength(dev);  // Получаем длину данных
   packet_t rxPacket;
 
-  dwGetData(dev, (uint8_t*)&rxPacket, dataLength);
-  const rangePacket2_t* packet = (rangePacket2_t*)rxPacket.payload;
+  dwGetData(dev, (uint8_t*)&rxPacket, dataLength);  // Получаем пакет данных
+  const rangePacket2_t* packet = (rangePacket2_t*)rxPacket.payload;  // Указатель на полезную нагрузку пакета
 
   bool lppSent = false;
-  if (packet->type == PACKET_TYPE_TDOA2) {
-    const uint8_t anchor = rxPacket.sourceAddress & 0xff;
+  if (packet->type == PACKET_TYPE_TDOA2) {  // Если пакет типа TDOA2
+    const uint8_t anchor = rxPacket.sourceAddress & 0xff;  // Извлекаем адреся якоря, отправившего пакет
 
     // Check if we need to send the current LPP packet
+    // Проверяем, надо ли отправить ответ
     if (lppPacketToSend && lppPacket.dest == anchor) {
-      sendLppShort(dev, &lppPacket);
+      sendLppShort(dev, &lppPacket);  // Отправляем
       lppSent = true;
     }
 
     dwTime_t arrival = {.full = 0};
-    dwGetReceiveTimestamp(dev, &arrival);
+    dwGetReceiveTimestamp(dev, &arrival);  // Извлекаем метку времени приема пакета
 
-    if (anchor < LOCODECK_NR_OF_TDOA2_ANCHORS) {
-      uint32_t now_ms = T2M(xTaskGetTickCount());
+    if (anchor < LOCODECK_NR_OF_TDOA2_ANCHORS) {  // Если айди меньше, чем количество анкеров
+      uint32_t now_ms = T2M(xTaskGetTickCount());  // Текущее время в мс
 
-      const int64_t rxAn_by_T_in_cl_T = arrival.full;
-      const int64_t txAn_in_cl_An = packet->timestamps[anchor];
-      const uint8_t seqNr = packet->sequenceNrs[anchor] & 0x7f;
+      const int64_t rxAn_by_T_in_cl_T = arrival.full;  // Получаем время приема пакета нами
+      const int64_t txAn_in_cl_An = packet->timestamps[anchor];  // Получаем время отправки пакета 
+      const uint8_t seqNr = packet->sequenceNrs[anchor] & 0x7f;  // Получаем номер пакета
 
       tdoaAnchorContext_t anchorCtx;
-      tdoaEngineGetAnchorCtxForPacketProcessing(&tdoaEngineState, anchor, now_ms, &anchorCtx);
-      updateRemoteData(&anchorCtx, packet);
-      tdoaEngineProcessPacket(&tdoaEngineState, &anchorCtx, txAn_in_cl_An, rxAn_by_T_in_cl_T);
-      tdoaStorageSetRxTxData(&anchorCtx, rxAn_by_T_in_cl_T, txAn_in_cl_An, seqNr);
+      tdoaEngineGetAnchorCtxForPacketProcessing(&tdoaEngineState, anchor, now_ms, &anchorCtx);  // Обработка пакета
+      updateRemoteData(&anchorCtx, packet);  // Обновить инфу о удаленных анкерах
+      tdoaEngineProcessPacket(&tdoaEngineState, &anchorCtx, txAn_in_cl_An, rxAn_by_T_in_cl_T);  // Обработка пакета, с передачей временных меток
+      tdoaStorageSetRxTxData(&anchorCtx, rxAn_by_T_in_cl_T, txAn_in_cl_An, seqNr);  // Сохраняются временнные метки
 
-      logClockCorrection[anchor] = tdoaStorageGetClockCorrection(&anchorCtx);
+      logClockCorrection[anchor] = tdoaStorageGetClockCorrection(&anchorCtx);  // Логирование коррекции часов для текущего удаленного анкера
 
-      previousAnchor = anchor;
+      previousAnchor = anchor;  // Запоминаем, какой якорь был обработан последним
 
-      handleLppPacket(dataLength, &rxPacket, &anchorCtx);
+      handleLppPacket(dataLength, &rxPacket, &anchorCtx);  // Обработка LPP пакета
 
-      rangingOk = true;
+      rangingOk = true;  // Успешная обработка пакета
     }
   }
 
   return lppSent;
 }
 
+// Устанавливает UWB в RX mode
 static void setRadioInReceiveMode(dwDevice_t *dev) {
   dwNewReceive(dev);
   dwSetDefaults(dev);
   dwStartReceive(dev);
 }
 
+// Обрабатывает события, возникающие при работе UWB-устройства 
+// (например, события приёма, отправки пакетов, ошибки и тайм-ауты).
 static uint32_t onEvent(dwDevice_t *dev, uwbEvent_t event) {
   switch(event) {
     case eventPacketReceived:
