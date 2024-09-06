@@ -264,60 +264,68 @@ static void setRadioInReceiveMode(dwDevice_t *dev) {
 
 // Обрабатывает события, возникающие при работе UWB-устройства 
 // (например, события приёма, отправки пакетов, ошибки и тайм-ауты).
+
+// dev: указатель на структуру dwDevice_t, представляющую радиоустройство, 
+// через которое обрабатываются события.
+// event: тип события uwbEvent_t, который нужно обработать.
 static uint32_t onEvent(dwDevice_t *dev, uwbEvent_t event) {
   switch(event) {
     case eventPacketReceived:
-      if (rxcallback(dev)) {
-        lppPacketToSend = false;
+      if (rxcallback(dev)) {  // Вызыв колбека, проверка. Если пакет обработан и отправлен ответ
+        lppPacketToSend = false;  // Флаг lppPacketToSend = false
       } else {
-        setRadioInReceiveMode(dev);
+        setRadioInReceiveMode(dev);  // Иначе ставим UWB в RX mode
 
         // Discard lpp packet if we cannot send it for too long
-        if (++lppPacketSendTryCounter >= TDOA2_LPP_PACKET_SEND_TIMEOUT) {
-          lppPacketToSend = false;
+        if (++lppPacketSendTryCounter >= TDOA2_LPP_PACKET_SEND_TIMEOUT) {  // Если счетчик попыток слишком большой
+          lppPacketToSend = false;  // Флаг сбрасывается
         }
       }
 
-      if (!lppPacketToSend) {
+      if (!lppPacketToSend) {  // Если флаг сброшен
         // Get next lpp packet
-        lppPacketToSend = lpsGetLppShort(&lppPacket);
-        lppPacketSendTryCounter = 0;
+        lppPacketToSend = lpsGetLppShort(&lppPacket);  // Пытаемся получить следующий LPP пакет
+        lppPacketSendTryCounter = 0;  // Сброс счетчика попыток
       }
       break;
-    case eventTimeout:
+    case eventTimeout:  // Далее
       // Fall through
-    case eventReceiveFailed:
+    case eventReceiveFailed:  // Далее
       // Fall through
-    case eventReceiveTimeout:
-      setRadioInReceiveMode(dev);
+    case eventReceiveTimeout:  // Таймаут, Неудача получения пакета, Таймаут получения
+      setRadioInReceiveMode(dev);  // Переходим снова в режим RX
       break;
-    case eventPacketSent:
+    case eventPacketSent:  // UWB автоматически перейдет в режим RX после отправки
       // Service packet sent, the radio is back to receive automatically
       break;
-    default:
+    default:  // Любое другое событие - ошибка
       ASSERT_FAILED();
   }
 
-  uint32_t now = xTaskGetTickCount();
+  uint32_t now = xTaskGetTickCount();  // Получаем текущее время
   uint16_t rangingState = 0;
-  for (int anchor = 0; anchor < LOCODECK_NR_OF_TDOA2_ANCHORS; anchor++) {
-    if (now < history[anchor].anchorStatusTimeout) {
-      rangingState |= (1 << anchor);
+  for (int anchor = 0; anchor < LOCODECK_NR_OF_TDOA2_ANCHORS; anchor++) {  // Перебор всех якорей
+    if (now < history[anchor].anchorStatusTimeout) {  // Если текущее меньше, чем таймаут - якорь активный
+      rangingState |= (1 << anchor);  // Ставим бит в переменную
     }
   }
-  locoDeckSetRangingState(rangingState);
+  locoDeckSetRangingState(rangingState);  // Уставновить статус общения с анкерами
 
-  return MAX_TIMEOUT;
+  return MAX_TIMEOUT;  // Для управления временем ожидания в системе
 }
 
+// Предназначена для обработки измерений TDoA и отправки их в систему оценивания положения
 
+// tdoaMeasurement: указатель на структуру tdoaMeasurement_t, 
+// содержащую данные измерения TDoA, включая идентификаторы якорей, 
+// разницу расстояний и стандартное отклонение.
 static void sendTdoaToEstimatorCallback(tdoaMeasurement_t* tdoaMeasurement) {
   // Override the default standard deviation set by the TDoA engine.
-  tdoaMeasurement->stdDev = stdDev;
+  tdoaMeasurement->stdDev = stdDev;  // Устанавливается стандартное отклонение 0.15f
 
-  estimatorEnqueueTDOA(tdoaMeasurement);
+  estimatorEnqueueTDOA(tdoaMeasurement);  // Добавление в очередь эстиматора (локализатор)
 
-  #ifdef CONFIG_DECK_LOCO_2D_POSITION
+  #ifdef CONFIG_DECK_LOCO_2D_POSITION  // Если включена локализация только 2D
   heightMeasurement_t heightData;
   heightData.timestamp = xTaskGetTickCount();
   heightData.height = DECK_LOCO_2D_POSITION_HEIGHT;
@@ -325,71 +333,88 @@ static void sendTdoaToEstimatorCallback(tdoaMeasurement_t* tdoaMeasurement) {
   estimatorEnqueueAbsoluteHeight(&heightData);
   #endif
 
-  const uint8_t idA = tdoaMeasurement->anchorIds[0];
+  const uint8_t idA = tdoaMeasurement->anchorIds[0];  // Извлекаются айди пары анкеров
   const uint8_t idB = tdoaMeasurement->anchorIds[1];
-  if (isConsecutiveIds(idA, idB)) {
-    logUwbTdoaDistDiff[idB] = tdoaMeasurement->distanceDiff;
+  if (isConsecutiveIds(idA, idB)) {  // Если последовательны
+    logUwbTdoaDistDiff[idB] = tdoaMeasurement->distanceDiff;  // Записываем разницу между ними для второго анкера
   }
 }
 
-
+// Настраивает и инициализирует систему для работы с UWB
 static void Initialize(dwDevice_t *dev) {
-  uint32_t now_ms = T2M(xTaskGetTickCount());
+  uint32_t now_ms = T2M(xTaskGetTickCount());  // Текущее время
+  // Инит движка, Статус, текущее время, коллбек, для отправки измерений, частота, алгоритм вычисления
   tdoaEngineInit(&tdoaEngineState, now_ms, sendTdoaToEstimatorCallback, LOCODECK_TS_FREQ, TdoaEngineMatchingAlgorithmYoungest);
 
-  previousAnchor = 0;
+  previousAnchor = 0;  // Инит переменной, с последним анкером
 
-  lppPacketToSend = false;
+  lppPacketToSend = false;  // Инит флага, что пакет надо отправить
 
-  locoDeckSetRangingState(0);
-  dwSetReceiveWaitTimeout(dev, TDOA2_RECEIVE_TIMEOUT);
+  locoDeckSetRangingState(0);  // Нет активных анкеров в начале
+  dwSetReceiveWaitTimeout(dev, TDOA2_RECEIVE_TIMEOUT);  // Настройка таймаута на ожидание приема
 
-  dwCommitConfiguration(dev);
+  dwCommitConfiguration(dev);  // Применение конфигурации
 
-  rangingOk = false;
+  rangingOk = false;  // Инит переменной и начальное состояние
 }
 
+// Возвращает статус rangingOk
 static bool isRangingOk()
 {
   return rangingOk;
 }
 
-static bool getAnchorPosition(const uint8_t anchorId, point_t* position) {
-  tdoaAnchorContext_t anchorCtx;
-  uint32_t now_ms = T2M(xTaskGetTickCount());
+// Предназначена для получения позиции якоря по его идентификатору.
 
+// anchorId: идентификатор якоря, для которого нужно получить позицию.
+// position: указатель на структуру point_t, куда будет сохранена позиция якоря 
+static bool getAnchorPosition(const uint8_t anchorId, point_t* position) {
+  tdoaAnchorContext_t anchorCtx;  // Создаем контекст
+  uint32_t now_ms = T2M(xTaskGetTickCount());  // Получаем время сейчас
+
+// Ищем контекст в массиве по айдишнику анкера. Если найден, сохраняется в anchorCtx
   bool contextFound = tdoaStorageGetAnchorCtx(tdoaEngineState.anchorInfoArray, anchorId, now_ms, &anchorCtx);
-  if (contextFound) {
-    tdoaStorageGetAnchorPosition(&anchorCtx, position);
-    return true;
+  if (contextFound) {  // Если найден контекст
+    tdoaStorageGetAnchorPosition(&anchorCtx, position);  // Извлекает позиция анкера
+    return true;  // Возврат тру
   }
 
   return false;
 }
 
+// Получает список айди анкеров
 static uint8_t getAnchorIdList(uint8_t unorderedAnchorList[], const int maxListSize) {
   return tdoaStorageGetListOfAnchorIds(tdoaEngineState.anchorInfoArray, unorderedAnchorList, maxListSize);
 }
 
+// Получает список активных анкеров
 static uint8_t getActiveAnchorIdList(uint8_t unorderedAnchorList[], const int maxListSize) {
-  uint32_t now_ms = T2M(xTaskGetTickCount());
+  uint32_t now_ms = T2M(xTaskGetTickCount());  // Время сейчас
   return tdoaStorageGetListOfActiveAnchorIds(tdoaEngineState.anchorInfoArray, unorderedAnchorList, maxListSize, now_ms);
 }
 
 // Loco Posisioning Protocol (LPP) handling
+// Обрабатывает короткие LPP-пакеты (Low Power Protocol) от якорей 
+// и обновляет информацию о положении якоря, если пакет содержит данные о позиции.
+
+// srcId: идентификатор источника пакета (якоря), от которого поступил пакет.
+// data: указатель на данные пакета
+// anchorCtx: указатель на контекст якоря (tdoaAnchorContext_t), 
+// который будет обновляться, если пакет содержит информацию о позиции.
 static void lpsHandleLppShortPacket(const uint8_t srcId, const uint8_t *data, tdoaAnchorContext_t* anchorCtx)
 {
-  uint8_t type = data[0];
+  uint8_t type = data[0];  // Определяем тип пакета по первому байту
 
-  if (type == LPP_SHORT_ANCHORPOS) {
-    if (srcId < LOCODECK_NR_OF_TDOA2_ANCHORS) {
-      struct lppShortAnchorPos_s *newpos = (struct lppShortAnchorPos_s*)&data[1];
-      tdoaStorageSetAnchorPosition(anchorCtx, newpos->x, newpos->y, newpos->z);
+  if (type == LPP_SHORT_ANCHORPOS) {  // Если тип SHORT_ANCHORPOS
+    if (srcId < LOCODECK_NR_OF_TDOA2_ANCHORS) {  // Проверка, что айди источника меньше общего количества
+      struct lppShortAnchorPos_s *newpos = (struct lppShortAnchorPos_s*)&data[1];  // Интерпретирует данные, начиная со второго байта, как структуру lppShortAnchorPos_s, содержащую координаты позиции якоря
+      tdoaStorageSetAnchorPosition(anchorCtx, newpos->x, newpos->y, newpos->z);  // Обновляем позицию анкера
     }
   }
 }
 
-uwbAlgorithm_t uwbTdoa2TagAlgorithm = {
+// Заполнение структуры для инициализации алгоритма
+uwbAlgorithm_t uwbTdoa2TagAlgorithm = {  
   .init = Initialize,
   .onEvent = onEvent,
   .isRangingOk = isRangingOk,
@@ -398,9 +423,12 @@ uwbAlgorithm_t uwbTdoa2TagAlgorithm = {
   .getActiveAnchorIdList = getActiveAnchorIdList,
 };
 
+// Применить новые опции
 void lpsTdoa2TagSetOptions(lpsTdoa2AlgoOptions_t* newOptions) {
   options = newOptions;
 }
+
+// ЛОГИРОВАНИЕ
 
 LOG_GROUP_START(tdoa2)
 LOG_ADD(LOG_FLOAT, d7-0, &logUwbTdoaDistDiff[0])
